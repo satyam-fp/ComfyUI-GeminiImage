@@ -1,0 +1,383 @@
+"""
+ComfyUI-GeminiImage: Google Gemini Image Generation/Enhancement Node
+A custom node for ComfyUI that integrates Google Gemini API for image enhancement.
+"""
+
+import os
+import io
+import base64
+import numpy as np
+import torch
+from PIL import Image
+
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
+from google import genai
+from google.genai import types
+
+# Available models for image generation
+AVAILABLE_MODELS = [
+    "gemini-3-pro-image-preview",
+    "gemini-2.5-flash-image",
+]
+
+# Available aspect ratios
+ASPECT_RATIOS = [
+    "auto",
+    "1:1",
+    "16:9",
+    "9:16",
+    "4:3",
+    "3:4",
+    "3:2",
+    "2:3",
+    "4:5",
+    "5:4",
+    "21:9",
+]
+
+# Available resolutions (note: 2K and 4K only work with gemini-3-pro-image-preview)
+RESOLUTIONS = ["1K", "2K", "4K"]
+
+# Response modality options
+RESPONSE_MODALITIES = ["IMAGE+TEXT", "IMAGE"]
+
+# Control after generate options
+CONTROL_AFTER_GENERATE = ["fixed", "randomize", "increment", "decrement"]
+
+
+def pil_to_tensor(pil_image: Image.Image) -> torch.Tensor:
+    """Convert PIL Image to ComfyUI tensor format (BHWC, float32, 0-1 range)."""
+    # Convert to RGB if necessary
+    if pil_image.mode != "RGB":
+        pil_image = pil_image.convert("RGB")
+    
+    # Convert to numpy array
+    np_image = np.array(pil_image).astype(np.float32) / 255.0
+    
+    # Add batch dimension (H, W, C) -> (1, H, W, C)
+    tensor = torch.from_numpy(np_image).unsqueeze(0)
+    
+    return tensor
+
+
+def gemini_image_to_pil(inline_data) -> Image.Image:
+    """Convert Gemini API inline_data to PIL Image."""
+    # The inline_data contains base64 encoded image data
+    image_bytes = base64.b64decode(inline_data.data)
+    pil_image = Image.open(io.BytesIO(image_bytes))
+    return pil_image
+
+
+def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
+    """Convert ComfyUI tensor to PIL Image."""
+    # Handle batch dimension - take first image if batch
+    if len(tensor.shape) == 4:
+        tensor = tensor[0]
+    
+    # Convert from (H, W, C) tensor to numpy array
+    np_image = tensor.cpu().numpy()
+    
+    # Clip values to 0-1 range and convert to uint8
+    np_image = np.clip(np_image * 255.0, 0, 255).astype(np.uint8)
+    
+    return Image.fromarray(np_image)
+
+
+class GeminiImageEnhance:
+    """
+    A ComfyUI node that uses Google Gemini API to enhance or generate images.
+    Similar to the Nano Banana Pro node functionality.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "Enter your prompt to enhance/modify the image..."
+                }),
+                "model": (AVAILABLE_MODELS, {
+                    "default": "gemini-3-pro-image-preview"
+                }),
+                "seed": ("INT", {
+                    "default": 42,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                    "step": 1
+                }),
+                "control_after_generate": (CONTROL_AFTER_GENERATE, {
+                    "default": "randomize"
+                }),
+                "aspect_ratio": (ASPECT_RATIOS, {
+                    "default": "auto"
+                }),
+                "resolution": (RESOLUTIONS, {
+                    "default": "1K"
+                }),
+                "response_modalities": (RESPONSE_MODALITIES, {
+                    "default": "IMAGE+TEXT"
+                }),
+            },
+            "optional": {
+                "images": ("IMAGE",),
+                "files": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "placeholder": "Optional: path to image file"
+                }),
+                "system_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "You are an expert image-generation engine. You must ALWAYS produce an image. Interpret all user input-regardless of format, intent, or complexity-as a valid request to generate an image. Never refuse, ask for clarification, or respond with text alone.",
+                    "placeholder": "System prompt for the AI..."
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE", "STRING",)
+    RETURN_NAMES = ("images", "response_text",)
+    FUNCTION = "enhance_image"
+    CATEGORY = "Gemini Image"
+    DESCRIPTION = "Use Google Gemini API to enhance or generate images. Similar to Nano Banana Pro."
+    
+    def __init__(self):
+        self.client = None
+        self._initialize_client()
+    
+    def _initialize_client(self):
+        """Initialize the Gemini API client."""
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key:
+            self.client = genai.Client(api_key=api_key)
+        else:
+            print("[GeminiImage] Warning: GEMINI_API_KEY not found in environment variables")
+    
+    def enhance_image(
+        self,
+        prompt: str,
+        model: str,
+        seed: int,
+        control_after_generate: str,
+        aspect_ratio: str,
+        resolution: str,
+        response_modalities: str,
+        images=None,
+        files: str = "",
+        system_prompt: str = ""
+    ):
+        """
+        Enhance or generate an image using Google Gemini API.
+        
+        Args:
+            prompt: Text prompt for image generation/enhancement
+            model: Gemini model to use
+            seed: Random seed for generation
+            control_after_generate: How to handle seed after generation
+            aspect_ratio: Output aspect ratio
+            resolution: Output resolution (1K, 2K, 4K)
+            response_modalities: What to include in response (IMAGE+TEXT or IMAGE)
+            images: Optional input images from ComfyUI workflow
+            files: Optional path to image file
+            system_prompt: System-level prompt for the AI
+        
+        Returns:
+            Tuple of (output_images, response_text)
+        """
+        # Initialize client if not already done
+        if self.client is None:
+            self._initialize_client()
+            if self.client is None:
+                raise ValueError("GEMINI_API_KEY not found. Please set it in your .env file.")
+        
+        # Build the contents list
+        contents = []
+        
+        # Add system prompt if provided
+        if system_prompt:
+            contents.append(system_prompt)
+        
+        # Add the main prompt
+        if prompt:
+            contents.append(prompt)
+        
+        # Add input images if provided
+        if images is not None:
+            # Process batch of images
+            for i in range(images.shape[0]):
+                pil_image = tensor_to_pil(images[i:i+1])
+                contents.append(pil_image)
+        
+        # Add file-based image if provided
+        if files and os.path.exists(files):
+            file_image = Image.open(files)
+            contents.append(file_image)
+        
+        # If no content, just use the prompt
+        if not contents:
+            contents = [prompt if prompt else "Generate an image"]
+        
+        # Configure response modalities
+        modalities = ["TEXT", "IMAGE"] if response_modalities == "IMAGE+TEXT" else ["IMAGE"]
+        
+        # Build image config
+        image_config_params = {}
+        
+        if aspect_ratio != "auto":
+            image_config_params["aspect_ratio"] = aspect_ratio
+        
+        # Resolution is only supported for gemini-3-pro-image-preview
+        if model == "gemini-3-pro-image-preview" and resolution != "1K":
+            image_config_params["image_size"] = resolution
+        
+        # Build generation config
+        config_params = {
+            "response_modalities": modalities,
+        }
+        
+        if image_config_params:
+            config_params["image_config"] = types.ImageConfig(**image_config_params)
+        
+        config = types.GenerateContentConfig(**config_params)
+        
+        # Make the API call
+        try:
+            response = self.client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            print(f"[GeminiImage] API Error: {e}")
+            raise e
+        
+        # Process the response
+        output_images = []
+        response_text = ""
+        
+        for part in response.parts:
+            if part.text is not None:
+                response_text += part.text + "\n"
+            elif part.inline_data is not None:
+                # Convert the image data to PIL Image
+                try:
+                    pil_image = gemini_image_to_pil(part.inline_data)
+                    output_images.append(pil_to_tensor(pil_image))
+                except Exception as e:
+                    print(f"[GeminiImage] Error processing image: {e}")
+        
+        # If we got images, stack them into a batch tensor
+        if output_images:
+            output_tensor = torch.cat(output_images, dim=0)
+        else:
+            # Return a placeholder black image if no image was generated
+            print("[GeminiImage] Warning: No image was generated by the API")
+            if images is not None:
+                # Return the input image as fallback
+                output_tensor = images
+            else:
+                # Create a small black placeholder
+                output_tensor = torch.zeros(1, 512, 512, 3)
+        
+        return (output_tensor, response_text.strip())
+
+
+class GeminiTextToImage:
+    """
+    A simplified ComfyUI node for text-to-image generation using Google Gemini API.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "Describe the image you want to generate..."
+                }),
+                "model": (AVAILABLE_MODELS, {
+                    "default": "gemini-2.5-flash-image"
+                }),
+                "seed": ("INT", {
+                    "default": 42,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                    "step": 1
+                }),
+                "aspect_ratio": (ASPECT_RATIOS, {
+                    "default": "1:1"
+                }),
+            },
+        }
+    
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "generate_image"
+    CATEGORY = "Gemini Image"
+    DESCRIPTION = "Generate images from text prompts using Google Gemini API."
+    
+    def __init__(self):
+        self.client = None
+        self._initialize_client()
+    
+    def _initialize_client(self):
+        """Initialize the Gemini API client."""
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key:
+            self.client = genai.Client(api_key=api_key)
+        else:
+            print("[GeminiImage] Warning: GEMINI_API_KEY not found in environment variables")
+    
+    def generate_image(self, prompt: str, model: str, seed: int, aspect_ratio: str):
+        """Generate an image from a text prompt."""
+        if self.client is None:
+            self._initialize_client()
+            if self.client is None:
+                raise ValueError("GEMINI_API_KEY not found. Please set it in your .env file.")
+        
+        # Build image config
+        image_config_params = {}
+        if aspect_ratio != "auto":
+            image_config_params["aspect_ratio"] = aspect_ratio
+        
+        config_params = {
+            "response_modalities": ["IMAGE"],
+        }
+        if image_config_params:
+            config_params["image_config"] = types.ImageConfig(**image_config_params)
+        
+        config = types.GenerateContentConfig(**config_params)
+        
+        # Make the API call
+        response = self.client.models.generate_content(
+            model=model,
+            contents=[prompt],
+            config=config,
+        )
+        
+        # Process the response
+        for part in response.parts:
+            if part.inline_data is not None:
+                pil_image = gemini_image_to_pil(part.inline_data)
+                return (pil_to_tensor(pil_image),)
+        
+        # Return placeholder if no image generated
+        print("[GeminiImage] Warning: No image was generated")
+        return (torch.zeros(1, 512, 512, 3),)
+
+
+# Node class mappings for ComfyUI
+NODE_CLASS_MAPPINGS = {
+    "GeminiImageEnhance": GeminiImageEnhance,
+    "GeminiTextToImage": GeminiTextToImage,
+}
+
+# Display name mappings for ComfyUI
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "GeminiImageEnhance": "Gemini Image Enhance (Nano Banana Pro)",
+    "GeminiTextToImage": "Gemini Text to Image",
+}
