@@ -63,12 +63,53 @@ def pil_to_tensor(pil_image: Image.Image) -> torch.Tensor:
     return tensor
 
 
-def gemini_image_to_pil(inline_data) -> Image.Image:
-    """Convert Gemini API inline_data to PIL Image."""
-    # The inline_data contains base64 encoded image data
-    image_bytes = base64.b64decode(inline_data.data)
-    pil_image = Image.open(io.BytesIO(image_bytes))
-    return pil_image
+def gemini_part_to_pil(part) -> Image.Image:
+    """Convert a Gemini API response part to PIL Image.
+    
+    Handles both part.as_image() (google.genai.types.Image) and raw inline_data.
+    """
+    # First try using the official as_image() method
+    try:
+        genai_image = part.as_image()
+        
+        # The genai_image might be a types.Image object with _pil_image attribute
+        # or have a save() method that writes to a file-like object
+        if hasattr(genai_image, '_pil_image') and genai_image._pil_image is not None:
+            return genai_image._pil_image
+        
+        # Try to save to BytesIO and read back as PIL
+        buffer = io.BytesIO()
+        genai_image.save(buffer, format='PNG')
+        buffer.seek(0)
+        pil_image = Image.open(buffer)
+        pil_image.load()  # Force load
+        return pil_image
+        
+    except Exception as e:
+        print(f"[GeminiImage] as_image() failed: {e}, trying inline_data directly")
+    
+    # Fallback: try to use inline_data directly
+    if part.inline_data is not None:
+        data = part.inline_data.data
+        
+        # Check if data is already bytes or needs base64 decoding
+        if isinstance(data, bytes):
+            image_bytes = data
+        elif isinstance(data, str):
+            image_bytes = base64.b64decode(data)
+        else:
+            raise ValueError(f"Unexpected data type for inline_data.data: {type(data)}")
+        
+        try:
+            pil_image = Image.open(io.BytesIO(image_bytes))
+            pil_image.load()
+            return pil_image
+        except Exception as e:
+            print(f"[GeminiImage] Failed to open from inline_data. Type: {type(data)}, Length: {len(image_bytes)}")
+            print(f"[GeminiImage] MIME type: {getattr(part.inline_data, 'mime_type', 'unknown')}")
+            raise e
+    
+    raise ValueError("No image data found in part")
 
 
 def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
@@ -264,7 +305,7 @@ class GeminiImageEnhance:
             elif part.inline_data is not None:
                 # Convert the image data to PIL Image
                 try:
-                    pil_image = gemini_image_to_pil(part.inline_data)
+                    pil_image = gemini_part_to_pil(part)
                     output_images.append(pil_to_tensor(pil_image))
                 except Exception as e:
                     print(f"[GeminiImage] Error processing image: {e}")
@@ -362,7 +403,7 @@ class GeminiTextToImage:
         # Process the response
         for part in response.parts:
             if part.inline_data is not None:
-                pil_image = gemini_image_to_pil(part.inline_data)
+                pil_image = gemini_part_to_pil(part)
                 return (pil_to_tensor(pil_image),)
         
         # Return placeholder if no image generated
