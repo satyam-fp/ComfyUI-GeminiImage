@@ -23,29 +23,81 @@ AVAILABLE_MODELS = [
     "gemini-2.5-flash-image",
 ]
 
-# Available aspect ratios
-ASPECT_RATIOS = [
-    "auto",
-    "1:1",
-    "16:9",
-    "9:16",
-    "4:3",
-    "3:4",
-    "3:2",
-    "2:3",
-    "4:5",
-    "5:4",
-    "21:9",
-]
-
-# Available resolutions (note: 2K and 4K only work with gemini-3-pro-image-preview)
-RESOLUTIONS = ["1K", "2K", "4K"]
-
 # Response modality options
 RESPONSE_MODALITIES = ["IMAGE+TEXT", "IMAGE"]
 
 # Control after generate options
 CONTROL_AFTER_GENERATE = ["fixed", "randomize", "increment", "decrement"]
+
+# Supported aspect ratios by Gemini API
+SUPPORTED_ASPECT_RATIOS = [
+    "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "4:5", "5:4", "21:9"
+]
+
+
+def resolution_to_api_size(resolution: int, model: str) -> str:
+    """Map an integer resolution to the closest Gemini API image_size value.
+    
+    Args:
+        resolution: Integer resolution (e.g., 512, 1024, 2048, 4096)
+        model: The Gemini model being used
+    
+    Returns:
+        API image_size value: "1K", "2K", or "4K"
+    """
+    # gemini-2.5-flash-image only supports 1K
+    if model == "gemini-2.5-flash-image":
+        return "1K"
+    
+    # For gemini-3-pro-image-preview, map to closest supported resolution
+    if resolution <= 1536:  # Up to 1.5K -> 1K
+        return "1K"
+    elif resolution <= 3072:  # Up to 3K -> 2K
+        return "2K"
+    else:  # 3K+ -> 4K
+        return "4K"
+
+
+def get_aspect_ratio_from_dimensions(width: int, height: int) -> str:
+    """Calculate the closest supported aspect ratio from image dimensions.
+    
+    Args:
+        width: Image width in pixels
+        height: Image height in pixels
+    
+    Returns:
+        Closest supported aspect ratio string (e.g., "16:9", "4:3")
+    """
+    if width == 0 or height == 0:
+        return "1:1"
+    
+    image_ratio = width / height
+    
+    # Map of aspect ratio strings to their decimal values
+    ratio_values = {
+        "1:1": 1.0,
+        "16:9": 16/9,
+        "9:16": 9/16,
+        "4:3": 4/3,
+        "3:4": 3/4,
+        "3:2": 3/2,
+        "2:3": 2/3,
+        "4:5": 4/5,
+        "5:4": 5/4,
+        "21:9": 21/9,
+    }
+    
+    # Find the closest matching aspect ratio
+    closest_ratio = "1:1"
+    min_diff = float('inf')
+    
+    for ratio_str, ratio_val in ratio_values.items():
+        diff = abs(image_ratio - ratio_val)
+        if diff < min_diff:
+            min_diff = diff
+            closest_ratio = ratio_str
+    
+    return closest_ratio
 
 
 def pil_to_tensor(pil_image: Image.Image) -> torch.Tensor:
@@ -154,11 +206,16 @@ class GeminiImageEnhance:
                 "control_after_generate": (CONTROL_AFTER_GENERATE, {
                     "default": "randomize"
                 }),
-                "aspect_ratio": (ASPECT_RATIOS, {
-                    "default": "auto"
+                "aspect_ratio": (["from_input", "auto"] + SUPPORTED_ASPECT_RATIOS, {
+                    "default": "from_input",
+                    "tooltip": "Use 'from_input' to automatically detect aspect ratio from input image"
                 }),
-                "resolution": (RESOLUTIONS, {
-                    "default": "1K"
+                "resolution": ("INT", {
+                    "default": 1024,
+                    "min": 64,
+                    "max": 4096,
+                    "step": 64,
+                    "tooltip": "Output resolution. Will be mapped to closest API value (1K/2K/4K). 2K/4K only for gemini-3-pro."
                 }),
                 "response_modalities": (RESPONSE_MODALITIES, {
                     "default": "IMAGE+TEXT"
@@ -204,7 +261,7 @@ class GeminiImageEnhance:
         seed: int,
         control_after_generate: str,
         aspect_ratio: str,
-        resolution: str,
+        resolution: int,
         response_modalities: str,
         images=None,
         files: str = "",
@@ -218,8 +275,8 @@ class GeminiImageEnhance:
             model: Gemini model to use
             seed: Random seed for generation
             control_after_generate: How to handle seed after generation
-            aspect_ratio: Output aspect ratio
-            resolution: Output resolution (1K, 2K, 4K)
+            aspect_ratio: Output aspect ratio ('from_input' to auto-detect from input image)
+            resolution: Output resolution as integer (will be mapped to 1K/2K/4K)
             response_modalities: What to include in response (IMAGE+TEXT or IMAGE)
             images: Optional input images from ComfyUI workflow
             files: Optional path to image file
@@ -237,6 +294,10 @@ class GeminiImageEnhance:
         # Build the contents list
         contents = []
         
+        # Track input image dimensions for aspect ratio detection
+        input_width = 0
+        input_height = 0
+        
         # Add system prompt if provided
         if system_prompt:
             contents.append(system_prompt)
@@ -247,6 +308,11 @@ class GeminiImageEnhance:
         
         # Add input images if provided
         if images is not None:
+            # Get dimensions from first image for aspect ratio detection
+            # ComfyUI tensors are (B, H, W, C)
+            input_height = images.shape[1]
+            input_width = images.shape[2]
+            
             # Process batch of images
             for i in range(images.shape[0]):
                 pil_image = tensor_to_pil(images[i:i+1])
@@ -255,6 +321,9 @@ class GeminiImageEnhance:
         # Add file-based image if provided
         if files and os.path.exists(files):
             file_image = Image.open(files)
+            # Use file image dimensions if no tensor input
+            if input_width == 0 and input_height == 0:
+                input_width, input_height = file_image.size
             contents.append(file_image)
         
         # If no content, just use the prompt
@@ -267,12 +336,24 @@ class GeminiImageEnhance:
         # Build image config
         image_config_params = {}
         
-        if aspect_ratio != "auto":
+        # Handle aspect ratio
+        if aspect_ratio == "from_input":
+            # Auto-detect from input image
+            if input_width > 0 and input_height > 0:
+                detected_ratio = get_aspect_ratio_from_dimensions(input_width, input_height)
+                image_config_params["aspect_ratio"] = detected_ratio
+                print(f"[GeminiImage] Auto-detected aspect ratio: {detected_ratio} (from {input_width}x{input_height})")
+            # If no input image, don't set aspect_ratio (let API use default)
+        elif aspect_ratio != "auto":
             image_config_params["aspect_ratio"] = aspect_ratio
         
-        # Resolution is only supported for gemini-3-pro-image-preview
-        if model == "gemini-3-pro-image-preview" and resolution != "1K":
-            image_config_params["image_size"] = resolution
+        # Map integer resolution to API value
+        api_resolution = resolution_to_api_size(resolution, model)
+        
+        # Resolution is only supported for gemini-3-pro-image-preview and only if not 1K
+        if model == "gemini-3-pro-image-preview" and api_resolution != "1K":
+            image_config_params["image_size"] = api_resolution
+            print(f"[GeminiImage] Using resolution: {api_resolution} (from input {resolution})")
         
         # Build generation config
         config_params = {
