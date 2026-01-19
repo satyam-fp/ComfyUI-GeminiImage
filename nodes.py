@@ -430,7 +430,7 @@ class GeminiTextToImage:
                     "max": 0xffffffffffffffff,
                     "step": 1
                 }),
-                "aspect_ratio": (ASPECT_RATIOS, {
+                "aspect_ratio": (SUPPORTED_ASPECT_RATIOS, {
                     "default": "1:1"
                 }),
             },
